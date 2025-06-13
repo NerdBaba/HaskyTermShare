@@ -1,8 +1,9 @@
+{-# LANGUAGE ScopedTypeVariables #-}
 module Main where
 
 import Network.Socket hiding (recv) -- Hide recv from Network.Socket to avoid ambiguity
 import Network.Socket.ByteString (recv, sendAll) -- Import recv and sendAll for ByteString
-import Control.Concurrent (forkIO, threadDelay) -- Added threadDelay (might remove later)
+import Control.Concurrent (forkIO)
 import Control.Monad (forever)
 import qualified Data.ByteString.Char8 as B
 import Control.Concurrent.MVar -- Import MVar
@@ -45,7 +46,7 @@ handleClient serverState conn =
                     return ((Just conn, viewers), True) -- Return new state and flag
                 Just sharerConn -> do
                     -- Sharer already exists, this connection is a viewer
-                    putStrLn $ "Connection " ++ show conn ++ " assigned as Viewer."
+                    putStrLn $ "Connection " ++ show conn ++ " assigned as Viewer.\n"
                     return ((Just sharerConn, conn : viewers), False) -- Return new state and flag
 
         if isSharer
@@ -62,15 +63,17 @@ handleClient serverState conn =
                     return (Nothing, viewers) -- Remove sharer
                 _ -> do
                     -- It must be a viewer connection
-                    putStrLn "Viewer disconnected."
+                    putStrLn $ "Viewer " ++ show conn ++ " disconnected."
                     return (mSharer, delete conn viewers) -- Remove from viewers
         close conn -- Close the socket
+        putStrLn $ "Socket " ++ show conn ++ " closed."
     )
 
 -- Handles the Sharer connection
+-- Reads output from the sharer\'s PTY and forwards it to all connected viewers.
 handleSharer :: ServerState -> Socket -> IO ()
 handleSharer serverConnState sharerConn = forever $ do
-    -- Read output from the sharer's PTY
+    -- Read output from the sharer\'s PTY
     msg <- recv sharerConn 1024 -- Receive up to 1024 bytes
     if B.null msg
         then do
@@ -78,36 +81,43 @@ handleSharer serverConnState sharerConn = forever $ do
             putStrLn "Sharer recv loop detected disconnect."
             return () -- Exit the forever loop
         else do
-            -- Received data from sharer
-            -- Print locally on the server (optional, mainly for debugging)
-            -- B.putStr msg -- Removed local print to avoid server terminal clutter
-
+            -- Received data from sharer (PTY output)
             -- Forward the data to all connected viewers
             (mSharer, viewers) <- readMVar serverConnState -- Read state atomically
-            -- Note: viewers list might change concurrently, but readMVar gives a consistent snapshot
-            -- Need to handle potential exceptions during sendAll (e.g., viewer disconnects)
-            mapM_ (\viewerConn -> handle (\e -> putStrLn $ "Error sending to viewer: " ++ show (e :: IOException)) $ sendAll viewerConn msg) viewers
+
+            -- Send to each viewer, handling potential exceptions (e.g., viewer disconnects concurrently)
+            mapM_ (\viewerConn -> handle (\(e :: IOException) -> putStrLn $ "Error sending to viewer " ++ show viewerConn ++ ": " ++ show e) $ sendAll viewerConn msg) viewers
 
 -- Handles a Viewer connection
--- For now, viewers only receive data, they don't send PTY input.
--- We still need to read from the viewer socket to detect disconnection.
+-- Reads input from the viewer and forwards it to the sharer\'s PTY.
 handleViewer :: ServerState -> Socket -> IO ()
 handleViewer serverConnState viewerConn = forever $ do
     msg <- recv viewerConn 1024
     if B.null msg
         then do
             -- Viewer disconnected
-            putStrLn "Viewer recv loop detected disconnect."
+            putStrLn $ "Viewer " ++ show viewerConn ++ " recv loop detected disconnect."
             return () -- Exit the forever loop
     else do
-        -- Received data from viewer (unexpected input for now)
-        -- In a real implementation, this would be PTY input to send back to the sharer
-        -- B.putStrLn $ B.pack \"Server received unexpected data from viewer: \" <> msg -- Removed for cleaner output
-        return () -- Added to make the do block non-empty
+        -- Received data from viewer (this is viewer\'s input for the PTY)
+        -- putStrLn $ "Received " ++ show (B.length msg) ++ " bytes from viewer " ++ show viewerConn ++ ". Attempting to forward to sharer." -- Too verbose for server output
 
-    -- A small delay might be useful in a real viewer handler if it has other tasks,
-    -- but for just reading to detect disconnect, the B.null check is sufficient.
-    -- threadDelay 10000 -- Example delay (10ms)
+        -- Read the current state to get the sharer socket
+        (mSharer, _) <- readMVar serverConnState
+
+        case mSharer of
+            Just sharerConn -> do
+                -- Sharer exists, send the viewer\'s input to the sharer
+                -- Handle potential exceptions if sharer disconnects during send
+                handle (\(e :: IOException) -> putStrLn $ "Error sending viewer input to sharer " ++ show sharerConn ++ ": " ++ show e) $ do
+                    sendAll sharerConn msg
+                    -- putStrLn "Forwarded viewer input to sharer." -- Too verbose
+            Nothing -> do
+                -- No sharer connected, cannot forward input
+                putStrLn $ "Received viewer input from " ++ show viewerConn ++ ", but no sharer is connected to forward to."
+
+    -- A small delay might be useful if the loop is spinning too fast when there\'s no input.
+    -- However, recv is blocking, so it shouldn\'t be necessary just for detecting disconnects.
 
 
 resolve :: String -> IO AddrInfo
